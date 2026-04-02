@@ -1,0 +1,14 @@
+# Compiled output
+budget
+*.o
+
+# Runtime data files (user-specific, not part of source)
+budget.csv
+budget.cfg
+*.csv.tmp
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~
