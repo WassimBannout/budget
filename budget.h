@@ -61,6 +61,13 @@ typedef struct {
 void budget_init(Budget *b);
 void budget_free(Budget *b);
 
+/*
+ * budget_ensure_capacity — Grow b->transactions if it is full.
+ * Shared by budget.c and fileio.c to eliminate duplication.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+int budget_ensure_capacity(Budget *b);
+
 /* ── CRUD ────────────────────────────────────────────────────────────── */
 int  budget_add(Budget *b);
 int  budget_delete(Budget *b, int id);

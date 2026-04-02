@@ -17,7 +17,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <math.h>
 #include <unistd.h>   /* isatty(), STDOUT_FILENO */
 
 /* ── ANSI color codes ───────────────────────────────────────────────── */
@@ -26,25 +25,20 @@
 #define C_RED     "\033[31m"
 #define C_GREEN   "\033[32m"
 #define C_YELLOW  "\033[33m"
-#define C_BLUE    "\033[34m"
-#define C_MAGENTA "\033[35m"
 #define C_CYAN    "\033[36m"
-#define C_WHITE   "\033[37m"
 
-/* Resolved at runtime; see budget_init() */
+/* Resolved once in budget_init(); all display code reads this. */
 static int colors_on = 0;
 
 #define COL(code)  (colors_on ? (code)  : "")
 #define CRESET     (colors_on ? C_RESET : "")
 
-/* ── Internal helpers ────────────────────────────────────────────────── */
+/* ── Shared capacity management (also called from fileio.c) ─────────── */
 
-/*
- * grow_budget — Double the capacity of b->transactions.
- * Returns 0 on success, -1 on allocation failure.
- */
-static int grow_budget(Budget *b)
+int budget_ensure_capacity(Budget *b)
 {
+    if (b->count < b->capacity) return 0;
+
     int new_cap = b->capacity * 2;
     Transaction *tmp = realloc(b->transactions,
                                (size_t)new_cap * sizeof(Transaction));
@@ -57,9 +51,10 @@ static int grow_budget(Budget *b)
     return 0;
 }
 
+/* ── Internal helpers ────────────────────────────────────────────────── */
+
 /*
- * find_by_id — Linear scan for a transaction with the given ID.
- * Returns a pointer into b->transactions, or NULL if not found.
+ * find_by_id — Linear scan; returns pointer into b->transactions or NULL.
  */
 static Transaction *find_by_id(Budget *b, int id)
 {
@@ -70,14 +65,44 @@ static Transaction *find_by_id(Budget *b, int id)
     return NULL;
 }
 
+/*
+ * str_tolower_n — Copy at most (max-1) chars of src into dst, lowercased,
+ * and null-terminate.  Safe when dst and src are the same buffer.
+ */
+static void str_tolower_n(char *dst, const char *src, size_t max)
+{
+    size_t i;
+    for (i = 0; i < max - 1 && src[i] != '\0'; i++)
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = '\0';
+}
+
+/*
+ * parse_type_str — Map a (already lowercased) string to a TransactionType.
+ * Returns 1 on success, 0 if the string is not recognised.
+ * Separating parsing from prompting lets budget_edit reuse this without
+ * duplicating the loop logic.
+ */
+static int parse_type_str(const char *s, TransactionType *out)
+{
+    if (strcmp(s, "i") == 0 || strcmp(s, "income") == 0) {
+        *out = INCOME;
+        return 1;
+    }
+    if (strcmp(s, "e") == 0 || strcmp(s, "expense") == 0) {
+        *out = EXPENSE;
+        return 1;
+    }
+    return 0;
+}
+
 /* ── Input helpers ───────────────────────────────────────────────────── */
 
 /*
  * read_line — Display prompt, read a line from stdin into buf.
  *
  * Strips the trailing newline and trims leading/trailing whitespace.
- * Returns 1 on success, 0 on EOF (Ctrl-D) — caller should treat 0 as
- * "operation cancelled".
+ * Returns 1 on success, 0 on EOF (Ctrl-D).
  */
 static int read_line(const char *prompt, char *buf, size_t size)
 {
@@ -86,10 +111,9 @@ static int read_line(const char *prompt, char *buf, size_t size)
 
     if (!fgets(buf, (int)size, stdin)) {
         printf("\n");
-        return 0; /* EOF / Ctrl-D */
+        return 0;
     }
 
-    /* Strip newline */
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[--len] = '\0';
 
@@ -109,8 +133,7 @@ static int read_line(const char *prompt, char *buf, size_t size)
 
 /*
  * read_double_positive — Prompt and parse a positive monetary amount.
- * Loops until the user enters a valid positive number, or returns 0
- * on EOF.
+ * Loops until valid or EOF.
  */
 static int read_double_positive(const char *prompt, double *out)
 {
@@ -118,7 +141,7 @@ static int read_double_positive(const char *prompt, double *out)
     while (1) {
         if (!read_line(prompt, buf, sizeof(buf))) return 0;
         if (buf[0] == '\0') {
-            printf("  Amount cannot be empty. Please try again.\n");
+            printf("  Amount cannot be empty.\n");
             continue;
         }
         char *end;
@@ -133,7 +156,7 @@ static int read_double_positive(const char *prompt, double *out)
 }
 
 /*
- * is_valid_date — Return 1 if s is a valid "YYYY-MM-DD" date string.
+ * is_valid_date — Return 1 if s is a valid "YYYY-MM-DD" string.
  */
 static int is_valid_date(const char *s)
 {
@@ -153,7 +176,6 @@ static int is_valid_date(const char *s)
     if (month < 1   || month > 12)  return 0;
     if (day < 1     || day > 31)    return 0;
 
-    /* Days-per-month check (simplified: ignores leap years for day 29-31) */
     static const int mdays[] = {0,31,29,31,30,31,30,31,31,30,31,30,31};
     if (day > mdays[month]) return 0;
 
@@ -161,13 +183,11 @@ static int is_valid_date(const char *s)
 }
 
 /*
- * read_date — Prompt for a date, defaulting to today if the user
- * presses Enter.  Loops until a valid YYYY-MM-DD is entered.
+ * read_date — Prompt for a date, defaulting to today on empty input.
  * Returns 1 on success, 0 on EOF.
  */
 static int read_date(const char *prompt, char *out, size_t out_size)
 {
-    /* Build today's date for the default hint */
     time_t now = time(NULL);
     struct tm *tm_now = localtime(&now);
     char today[MAX_DATE_LEN];
@@ -180,18 +200,15 @@ static int read_date(const char *prompt, char *out, size_t out_size)
     while (1) {
         if (!read_line(full_prompt, buf, sizeof(buf))) return 0;
 
-        /* Empty input → use today */
         if (buf[0] == '\0') {
             snprintf(out, out_size, "%s", today);
             return 1;
         }
-
         if (!is_valid_date(buf)) {
             printf("  Invalid date. Use YYYY-MM-DD format.\n");
             continue;
         }
-
-        /* is_valid_date guarantees exactly 10 chars; copy directly */
+        /* is_valid_date guarantees exactly 10 chars */
         memcpy(out, buf, 10);
         out[10] = '\0';
         return 1;
@@ -199,8 +216,7 @@ static int read_date(const char *prompt, char *out, size_t out_size)
 }
 
 /*
- * read_type — Prompt for "income" or "expense".
- * Accepts i/I/income and e/E/expense.
+ * read_type — Prompt until the user enters a valid type or EOF.
  * Returns 1 on success, 0 on EOF.
  */
 static int read_type(const char *prompt, TransactionType *out)
@@ -208,35 +224,30 @@ static int read_type(const char *prompt, TransactionType *out)
     char buf[32];
     while (1) {
         if (!read_line(prompt, buf, sizeof(buf))) return 0;
-
-        /* Lower-case the input */
-        for (size_t i = 0; buf[i]; i++)
-            buf[i] = (char)tolower((unsigned char)buf[i]);
-
-        if (strcmp(buf, "i") == 0 || strcmp(buf, "income") == 0) {
-            *out = INCOME;
-            return 1;
-        }
-        if (strcmp(buf, "e") == 0 || strcmp(buf, "expense") == 0) {
-            *out = EXPENSE;
-            return 1;
-        }
+        str_tolower_n(buf, buf, sizeof(buf));
+        if (parse_type_str(buf, out)) return 1;
         printf("  Enter 'income' (or 'i') / 'expense' (or 'e').\n");
     }
 }
 
-/* ── Display helpers ─────────────────────────────────────────────────── */
-
-/* Print a horizontal rule spanning the table width */
-static void print_rule(void)
+/*
+ * has_pipe — Return 1 if s contains the field separator character.
+ * Fields with '|' would corrupt the CSV.
+ */
+static int has_pipe(const char *s)
 {
-    printf("%s", COL(C_CYAN));
-    printf("----+------------+---------+------------+--------------------"
-           "+----------------------------------\n");
-    printf("%s", CRESET);
+    return strchr(s, '|') != NULL;
 }
 
-/* Print the column header row */
+/* ── Display helpers ─────────────────────────────────────────────────── */
+
+static void print_rule(void)
+{
+    printf("%s----+------------+---------+------------+--------------------"
+           "+----------------------------------\n%s",
+           COL(C_CYAN), CRESET);
+}
+
 static void print_header(void)
 {
     print_rule();
@@ -250,34 +261,34 @@ static void print_header(void)
     print_rule();
 }
 
-/* Print a single transaction row with appropriate color */
 static void print_row(const Transaction *t)
 {
-    const char *type_col  = (t->type == INCOME) ? COL(C_GREEN) : COL(C_RED);
-    const char *type_str  = (t->type == INCOME) ? "INCOME"     : "EXPENSE";
+    const char *col = (t->type == INCOME) ? COL(C_GREEN) : COL(C_RED);
+    const char *str = (t->type == INCOME) ? "INCOME" : "EXPENSE";
 
     printf("%s %3d%s | %s | %s%-7s%s | %s%10.2f%s | %-20.20s | %-32.32s\n",
            COL(C_BOLD), t->id, CRESET,
            t->date,
-           type_col, type_str, CRESET,
-           type_col, t->amount, CRESET,
+           col, str, CRESET,
+           col, t->amount, CRESET,
            t->category,
            t->description);
 }
 
-/* Print summary totals at the bottom of a list */
 static void print_totals(double income, double expense, int count)
 {
     double net = income - expense;
+    const char *net_col = (net >= 0) ? COL(C_GREEN) : COL(C_RED);
+
     print_rule();
     printf("  %s%d transaction(s)%s  |  "
            "Income: %s%.2f%s  |  "
            "Expenses: %s%.2f%s  |  "
-           "Net: %s%.2f%s\n",
+           "Net: %s%+.2f%s\n",
            COL(C_BOLD), count, CRESET,
            COL(C_GREEN), income,  CRESET,
            COL(C_RED),   expense, CRESET,
-           net >= 0 ? COL(C_GREEN) : COL(C_RED), net, CRESET);
+           net_col, net, CRESET);
     print_rule();
 }
 
@@ -315,7 +326,7 @@ void budget_init(Budget *b)
 {
     b->transactions = malloc(INITIAL_CAPACITY * sizeof(Transaction));
     if (!b->transactions) {
-        fprintf(stderr, "Fatal: cannot allocate initial transaction array\n");
+        fprintf(stderr, "Fatal: cannot allocate transaction array\n");
         exit(EXIT_FAILURE);
     }
     b->count        = 0;
@@ -323,7 +334,6 @@ void budget_init(Budget *b)
     b->next_id      = 1;
     b->budget_limit = 0.0;
 
-    /* Enable colors only when writing to a real terminal */
     colors_on = isatty(STDOUT_FILENO);
 }
 
@@ -337,15 +347,8 @@ void budget_free(Budget *b)
 
 /* ── CRUD ────────────────────────────────────────────────────────────── */
 
-/*
- * budget_add — Interactively prompt the user for all fields and append
- * a new transaction.  Returns 0 on success, -1 if the user cancelled
- * (EOF) or a memory error occurred.
- */
 int budget_add(Budget *b)
 {
-    if (b->count >= b->capacity && grow_budget(b) < 0) return -1;
-
     Transaction t;
     memset(&t, 0, sizeof(t));
 
@@ -353,80 +356,73 @@ int budget_add(Budget *b)
            COL(C_CYAN), CRESET);
     printf("  (Press Ctrl-D at any prompt to cancel.)\n\n");
 
-    /* Type */
-    if (!read_type("  Type [income/expense]: ", &t.type)) {
-        printf("  Cancelled.\n\n");
-        return -1;
-    }
+    if (!read_type("  Type [income/expense]: ", &t.type))
+        goto cancelled;
 
-    /* Date */
-    if (!read_date("  Date (YYYY-MM-DD)", t.date, MAX_DATE_LEN)) {
-        printf("  Cancelled.\n\n");
-        return -1;
-    }
+    if (!read_date("  Date (YYYY-MM-DD)", t.date, MAX_DATE_LEN))
+        goto cancelled;
 
-    /* Amount */
-    if (!read_double_positive("  Amount: ", &t.amount)) {
-        printf("  Cancelled.\n\n");
-        return -1;
-    }
+    if (!read_double_positive("  Amount: ", &t.amount))
+        goto cancelled;
 
-    /* Category */
+    /* Category — required, validated for '|' immediately */
     while (1) {
-        if (!read_line("  Category: ", t.category, MAX_CATEGORY_LEN)) {
-            printf("  Cancelled.\n\n");
-            return -1;
+        if (!read_line("  Category: ", t.category, MAX_CATEGORY_LEN))
+            goto cancelled;
+        if (t.category[0] == '\0') {
+            printf("  Category cannot be empty.\n");
+            continue;
         }
-        if (t.category[0] != '\0') break;
-        printf("  Category cannot be empty.\n");
+        if (has_pipe(t.category)) {
+            printf("  Category may not contain '|'.\n");
+            continue;
+        }
+        break;
     }
 
-    /* Description (optional) */
-    if (!read_line("  Description (optional): ", t.description, MAX_DESC_LEN)) {
-        printf("  Cancelled.\n\n");
-        return -1;
+    /* Description — optional, validated for '|' immediately */
+    while (1) {
+        if (!read_line("  Description (optional): ", t.description, MAX_DESC_LEN))
+            goto cancelled;
+        if (has_pipe(t.description)) {
+            printf("  Description may not contain '|'.\n");
+            continue;
+        }
+        break;
     }
     if (t.description[0] == '\0')
-        strncpy(t.description, "(no description)", MAX_DESC_LEN - 1);
+        memcpy(t.description, "(no description)", 17);
 
-    /* Check for '|' in fields — would corrupt the CSV */
-    if (strchr(t.category, '|') || strchr(t.description, '|')) {
-        fprintf(stderr,
-                "Error: fields may not contain the '|' character.\n");
-        return -1;
-    }
+    /* All input collected — grow array only if needed, then append */
+    if (budget_ensure_capacity(b) < 0) return -1;
 
     t.id = b->next_id++;
     b->transactions[b->count++] = t;
 
-    printf("\n  %s✓ Transaction #%d added.%s\n\n",
-           COL(C_GREEN), t.id, CRESET);
+    printf("\n  %s✓ Transaction #%d added.%s\n\n", COL(C_GREEN), t.id, CRESET);
     return 0;
+
+cancelled:
+    printf("  Cancelled.\n\n");
+    return -1;
 }
 
-/*
- * budget_delete — Remove the transaction with the given ID.
- * Uses a swap-with-last strategy for O(1) removal.
- * Returns 0 on success, -1 if not found.
- */
 int budget_delete(Budget *b, int id)
 {
     for (int i = 0; i < b->count; i++) {
-        if (b->transactions[i].id == id) {
-            /* Print what we're deleting */
-            printf("  Deleting: %s#%d%s — %s%.2f%s (%s) \"%s\"\n",
-                   COL(C_BOLD), id, CRESET,
-                   COL(C_YELLOW), b->transactions[i].amount, CRESET,
-                   b->transactions[i].category,
-                   b->transactions[i].description);
+        if (b->transactions[i].id != id) continue;
 
-            /* Swap with last, shrink count */
-            b->transactions[i] = b->transactions[b->count - 1];
-            b->count--;
+        printf("  Deleting: %s#%d%s — %s%.2f%s (%s) \"%s\"\n",
+               COL(C_BOLD), id, CRESET,
+               COL(C_YELLOW), b->transactions[i].amount, CRESET,
+               b->transactions[i].category,
+               b->transactions[i].description);
 
-            printf("  %s✓ Deleted.%s\n\n", COL(C_GREEN), CRESET);
-            return 0;
-        }
+        /* Swap with last element for O(1) removal */
+        b->transactions[i] = b->transactions[--b->count];
+
+        printf("  %s✓ Deleted.%s\n\n", COL(C_GREEN), CRESET);
+        return 0;
     }
 
     fprintf(stderr, "  %sError: no transaction with ID %d.%s\n\n",
@@ -435,18 +431,23 @@ int budget_delete(Budget *b, int id)
 }
 
 /*
- * budget_edit — Interactively edit an existing transaction.
- * Press Enter at any prompt to keep the existing value.
- * Returns 0 on success, -1 if not found or cancelled.
+ * budget_edit — Edit an existing transaction.
+ *
+ * Works on a *copy* of the stored transaction.  The original is only
+ * replaced after all fields are successfully collected, so a mid-edit
+ * cancellation leaves the stored data unchanged.
  */
 int budget_edit(Budget *b, int id)
 {
-    Transaction *t = find_by_id(b, id);
-    if (!t) {
+    Transaction *orig = find_by_id(b, id);
+    if (!orig) {
         fprintf(stderr, "  %sError: no transaction with ID %d.%s\n\n",
                 COL(C_RED), id, CRESET);
         return -1;
     }
+
+    /* Work on a stack copy — only commit it back on full success */
+    Transaction t = *orig;
 
     printf("\n%s── Edit Transaction #%d ─────────────────────────────────%s\n",
            COL(C_CYAN), id, CRESET);
@@ -454,47 +455,33 @@ int budget_edit(Budget *b, int id)
 
     /* Type */
     {
-        const char *cur = (t->type == INCOME) ? "income" : "expense";
+        const char *cur = (t.type == INCOME) ? "income" : "expense";
         char prompt[64];
         snprintf(prompt, sizeof(prompt), "  Type [income/expense] (%s): ", cur);
         char buf[32];
-        if (!read_line(prompt, buf, sizeof(buf))) {
-            printf("  Cancelled.\n\n");
-            return -1;
-        }
+        if (!read_line(prompt, buf, sizeof(buf))) goto cancelled;
         if (buf[0] != '\0') {
+            str_tolower_n(buf, buf, sizeof(buf));
             TransactionType new_type;
-            /* Reuse read_type logic inline */
-            for (size_t i = 0; buf[i]; i++)
-                buf[i] = (char)tolower((unsigned char)buf[i]);
-            if (strcmp(buf, "i") == 0 || strcmp(buf, "income") == 0)
-                new_type = INCOME;
-            else if (strcmp(buf, "e") == 0 || strcmp(buf, "expense") == 0)
-                new_type = EXPENSE;
-            else {
+            if (parse_type_str(buf, &new_type))
+                t.type = new_type;
+            else
                 printf("  Invalid type — keeping '%s'.\n", cur);
-                new_type = t->type;
-            }
-            t->type = new_type;
         }
     }
 
     /* Date */
     {
         char prompt[64];
-        snprintf(prompt, sizeof(prompt),
-                 "  Date (YYYY-MM-DD) (%s): ", t->date);
+        snprintf(prompt, sizeof(prompt), "  Date (YYYY-MM-DD) (%s): ", t.date);
         char buf[32];
-        if (!read_line(prompt, buf, sizeof(buf))) {
-            printf("  Cancelled.\n\n");
-            return -1;
-        }
+        if (!read_line(prompt, buf, sizeof(buf))) goto cancelled;
         if (buf[0] != '\0') {
-            if (!is_valid_date(buf)) {
-                printf("  Invalid date — keeping '%s'.\n", t->date);
-            } else {
-                strncpy(t->date, buf, MAX_DATE_LEN - 1);
-                t->date[MAX_DATE_LEN - 1] = '\0';
+            if (!is_valid_date(buf))
+                printf("  Invalid date — keeping '%s'.\n", t.date);
+            else {
+                memcpy(t.date, buf, 10);
+                t.date[10] = '\0';
             }
         }
     }
@@ -502,74 +489,61 @@ int budget_edit(Budget *b, int id)
     /* Amount */
     {
         char prompt[64];
-        snprintf(prompt, sizeof(prompt), "  Amount (%.2f): ", t->amount);
+        snprintf(prompt, sizeof(prompt), "  Amount (%.2f): ", t.amount);
         char buf[64];
-        if (!read_line(prompt, buf, sizeof(buf))) {
-            printf("  Cancelled.\n\n");
-            return -1;
-        }
+        if (!read_line(prompt, buf, sizeof(buf))) goto cancelled;
         if (buf[0] != '\0') {
             char *end;
             double v = strtod(buf, &end);
             if (*end != '\0' || v <= 0.0)
-                printf("  Invalid amount — keeping %.2f.\n", t->amount);
+                printf("  Invalid amount — keeping %.2f.\n", t.amount);
             else
-                t->amount = v;
+                t.amount = v;
         }
     }
 
     /* Category */
     {
         char prompt[128];
-        snprintf(prompt, sizeof(prompt),
-                 "  Category (%s): ", t->category);
+        snprintf(prompt, sizeof(prompt), "  Category (%s): ", t.category);
         char buf[MAX_CATEGORY_LEN];
-        if (!read_line(prompt, buf, sizeof(buf))) {
-            printf("  Cancelled.\n\n");
-            return -1;
-        }
+        if (!read_line(prompt, buf, sizeof(buf))) goto cancelled;
         if (buf[0] != '\0') {
-            if (strchr(buf, '|')) {
+            if (has_pipe(buf))
                 printf("  Category may not contain '|' — keeping '%s'.\n",
-                       t->category);
-            } else {
-                strncpy(t->category, buf, MAX_CATEGORY_LEN - 1);
-                t->category[MAX_CATEGORY_LEN - 1] = '\0';
-            }
+                       t.category);
+            else
+                snprintf(t.category, MAX_CATEGORY_LEN, "%s", buf);
         }
     }
 
     /* Description */
     {
-        char prompt[320];
-        snprintf(prompt, sizeof(prompt),
-                 "  Description (%s): ", t->description);
+        char prompt[MAX_DESC_LEN + 32];
+        snprintf(prompt, sizeof(prompt), "  Description (%s): ", t.description);
         char buf[MAX_DESC_LEN];
-        if (!read_line(prompt, buf, sizeof(buf))) {
-            printf("  Cancelled.\n\n");
-            return -1;
-        }
+        if (!read_line(prompt, buf, sizeof(buf))) goto cancelled;
         if (buf[0] != '\0') {
-            if (strchr(buf, '|')) {
+            if (has_pipe(buf))
                 printf("  Description may not contain '|' — keeping original.\n");
-            } else {
-                strncpy(t->description, buf, MAX_DESC_LEN - 1);
-                t->description[MAX_DESC_LEN - 1] = '\0';
-            }
+            else
+                snprintf(t.description, MAX_DESC_LEN, "%s", buf);
         }
     }
 
-    printf("\n  %s✓ Transaction #%d updated.%s\n\n",
-           COL(C_GREEN), id, CRESET);
+    /* All fields accepted — commit the copy back to the stored record */
+    *orig = t;
+
+    printf("\n  %s✓ Transaction #%d updated.%s\n\n", COL(C_GREEN), id, CRESET);
     return 0;
+
+cancelled:
+    printf("  Cancelled.\n\n");
+    return -1;
 }
 
 /* ── Display ─────────────────────────────────────────────────────────── */
 
-/*
- * budget_list — Print all transactions, optionally sorted.
- * Sorting is done on a heap copy so the stored order is unchanged.
- */
 void budget_list(const Budget *b, SortOrder sort)
 {
     if (b->count == 0) {
@@ -577,7 +551,6 @@ void budget_list(const Budget *b, SortOrder sort)
         return;
     }
 
-    /* Build a working copy for sorting */
     Transaction *copy = malloc((size_t)b->count * sizeof(Transaction));
     if (!copy) {
         fprintf(stderr, "Error: out of memory\n");
@@ -585,71 +558,52 @@ void budget_list(const Budget *b, SortOrder sort)
     }
     memcpy(copy, b->transactions, (size_t)b->count * sizeof(Transaction));
 
-    switch (sort) {
-        case SORT_DATE_ASC:    qsort(copy, b->count, sizeof(Transaction), cmp_date_asc);    break;
-        case SORT_DATE_DESC:   qsort(copy, b->count, sizeof(Transaction), cmp_date_desc);   break;
-        case SORT_AMOUNT_ASC:  qsort(copy, b->count, sizeof(Transaction), cmp_amount_asc);  break;
-        case SORT_AMOUNT_DESC: qsort(copy, b->count, sizeof(Transaction), cmp_amount_desc); break;
-        default: break;
-    }
+    typedef int (*cmp_fn)(const void *, const void *);
+    static const cmp_fn cmps[] = {
+        [SORT_DATE_ASC]    = cmp_date_asc,
+        [SORT_DATE_DESC]   = cmp_date_desc,
+        [SORT_AMOUNT_ASC]  = cmp_amount_asc,
+        [SORT_AMOUNT_DESC] = cmp_amount_desc,
+    };
+    if (sort != SORT_NONE)
+        qsort(copy, (size_t)b->count, sizeof(Transaction), cmps[sort]);
 
     printf("\n");
     print_header();
 
-    double total_income  = 0.0;
-    double total_expense = 0.0;
-
+    double income = 0.0, expense = 0.0;
     for (int i = 0; i < b->count; i++) {
         print_row(&copy[i]);
-        if (copy[i].type == INCOME)  total_income  += copy[i].amount;
-        else                          total_expense += copy[i].amount;
+        if (copy[i].type == INCOME) income  += copy[i].amount;
+        else                        expense += copy[i].amount;
     }
 
-    print_totals(total_income, total_expense, b->count);
+    print_totals(income, expense, b->count);
     printf("\n");
-
     free(copy);
 }
 
-/*
- * budget_filter — Show only transactions whose category matches
- * the given string (case-insensitive substring match).
- */
 void budget_filter(const Budget *b, const char *category)
 {
-    /* Build a lower-cased copy of the search term */
     char search[MAX_CATEGORY_LEN];
-    size_t slen = strlen(category);
-    if (slen >= MAX_CATEGORY_LEN) slen = MAX_CATEGORY_LEN - 1;
-    for (size_t i = 0; i < slen; i++)
-        search[i] = (char)tolower((unsigned char)category[i]);
-    search[slen] = '\0';
-
-    int   found   = 0;
-    double income  = 0.0;
-    double expense = 0.0;
+    str_tolower_n(search, category, sizeof(search));
 
     printf("\n%s── Transactions in category: \"%s%s%s\" ─────────────────%s\n\n",
-           COL(C_CYAN),
-           COL(C_BOLD), category, COL(C_CYAN),
-           CRESET);
+           COL(C_CYAN), COL(C_BOLD), category, COL(C_CYAN), CRESET);
     print_header();
 
-    for (int i = 0; i < b->count; i++) {
-        /* Lower-case the stored category for comparison */
-        char cat[MAX_CATEGORY_LEN];
-        size_t clen = strlen(b->transactions[i].category);
-        if (clen >= MAX_CATEGORY_LEN) clen = MAX_CATEGORY_LEN - 1;
-        for (size_t j = 0; j < clen; j++)
-            cat[j] = (char)tolower((unsigned char)b->transactions[i].category[j]);
-        cat[clen] = '\0';
+    int    found   = 0;
+    double income  = 0.0, expense = 0.0;
 
-        if (strstr(cat, search) != NULL) {
-            print_row(&b->transactions[i]);
-            if (b->transactions[i].type == INCOME) income  += b->transactions[i].amount;
-            else                                    expense += b->transactions[i].amount;
-            found++;
-        }
+    char cat[MAX_CATEGORY_LEN];
+    for (int i = 0; i < b->count; i++) {
+        str_tolower_n(cat, b->transactions[i].category, sizeof(cat));
+        if (!strstr(cat, search)) continue;
+
+        print_row(&b->transactions[i]);
+        if (b->transactions[i].type == INCOME) income  += b->transactions[i].amount;
+        else                                   expense += b->transactions[i].amount;
+        found++;
     }
 
     if (found == 0) {
@@ -659,91 +613,64 @@ void budget_filter(const Budget *b, const char *category)
     } else {
         print_totals(income, expense, found);
     }
-
     printf("\n");
 }
 
-/*
- * budget_summary — Overall income / expenses / net balance.
- */
 void budget_summary(const Budget *b)
 {
-    double total_income  = 0.0;
-    double total_expense = 0.0;
-
+    double income = 0.0, expense = 0.0;
     for (int i = 0; i < b->count; i++) {
-        if (b->transactions[i].type == INCOME)
-            total_income  += b->transactions[i].amount;
-        else
-            total_expense += b->transactions[i].amount;
+        if (b->transactions[i].type == INCOME) income  += b->transactions[i].amount;
+        else                                   expense += b->transactions[i].amount;
     }
-
-    double net = total_income - total_expense;
+    double net = income - expense;
 
     printf("\n%s╔══════════════════════════════════════╗%s\n", COL(C_CYAN), CRESET);
-    printf("%s║       BUDGET SUMMARY                 ║%s\n", COL(C_CYAN), CRESET);
+    printf("%s║         BUDGET SUMMARY               ║%s\n", COL(C_CYAN), CRESET);
     printf("%s╚══════════════════════════════════════╝%s\n", COL(C_CYAN), CRESET);
-    printf("  Total transactions : %s%d%s\n",    COL(C_BOLD), b->count, CRESET);
-    printf("  Total income       : %s+%.2f%s\n", COL(C_GREEN), total_income,  CRESET);
-    printf("  Total expenses     : %s-%.2f%s\n", COL(C_RED),   total_expense, CRESET);
+    printf("  Total transactions : %s%d%s\n",    COL(C_BOLD),  b->count, CRESET);
+    printf("  Total income       : %s+%.2f%s\n", COL(C_GREEN), income,   CRESET);
+    printf("  Total expenses     : %s-%.2f%s\n", COL(C_RED),   expense,  CRESET);
     printf("  ──────────────────────────────────────\n");
+    printf("  Net balance        : %s%+.2f%s\n\n",
+           net >= 0 ? COL(C_GREEN) : COL(C_RED), net, CRESET);
 
-    const char *net_col = (net >= 0) ? COL(C_GREEN) : COL(C_RED);
-    const char *net_sign = (net >= 0) ? "+" : "";
-    printf("  Net balance        : %s%s%.2f%s\n\n",
-           net_col, net_sign, net, CRESET);
-
-    if (b->budget_limit > 0.0) {
-        printf("  Monthly limit      : %.2f\n", b->budget_limit);
-    }
+    if (b->budget_limit > 0.0)
+        printf("  Monthly limit      : %.2f\n\n", b->budget_limit);
 }
 
-/*
- * budget_monthly_summary — Summarise a specific calendar month.
- * month must be "YYYY-MM".
- */
 void budget_monthly_summary(const Budget *b, const char *month)
 {
     if (!month || strlen(month) != 7 || month[4] != '-') {
-        fprintf(stderr, "  Error: month must be in YYYY-MM format "
-                        "(e.g. 2024-01).\n\n");
+        fprintf(stderr, "  Error: month must be YYYY-MM (e.g. 2024-01).\n\n");
         return;
     }
 
-    double income  = 0.0;
-    double expense = 0.0;
-    int    count   = 0;
+    double income = 0.0, expense = 0.0;
+    int    count  = 0;
 
     for (int i = 0; i < b->count; i++) {
-        /* Compare YYYY-MM prefix of date */
-        if (strncmp(b->transactions[i].date, month, 7) == 0) {
-            if (b->transactions[i].type == INCOME)
-                income  += b->transactions[i].amount;
-            else
-                expense += b->transactions[i].amount;
-            count++;
-        }
+        if (strncmp(b->transactions[i].date, month, 7) != 0) continue;
+        if (b->transactions[i].type == INCOME) income  += b->transactions[i].amount;
+        else                                   expense += b->transactions[i].amount;
+        count++;
     }
-
-    double net = income - expense;
 
     printf("\n%s── Monthly Summary: %s%s%s ──────────────────────────────%s\n",
            COL(C_CYAN), COL(C_BOLD), month, COL(C_CYAN), CRESET);
 
     if (count == 0) {
-        printf("  %sNo transactions for %s.%s\n\n",
-               COL(C_YELLOW), month, CRESET);
+        printf("  %sNo transactions for %s.%s\n\n", COL(C_YELLOW), month, CRESET);
         return;
     }
 
+    double net = income - expense;
     printf("  Transactions : %d\n", count);
     printf("  Income       : %s+%.2f%s\n", COL(C_GREEN), income,  CRESET);
     printf("  Expenses     : %s-%.2f%s\n", COL(C_RED),   expense, CRESET);
     printf("  ─────────────────────────────────────\n");
-
-    const char *net_col  = (net >= 0) ? COL(C_GREEN) : COL(C_RED);
-    const char *net_sign = (net >= 0) ? "+" : "";
-    printf("  Net balance  : %s%s%.2f%s\n", net_col, net_sign, net, CRESET);
+    printf("  Net balance  : %s%+.2f%s\n",
+           net >= 0 ? COL(C_GREEN) : COL(C_RED), net, CRESET);
 
     if (b->budget_limit > 0.0) {
         double pct = (expense / b->budget_limit) * 100.0;
@@ -764,22 +691,15 @@ void budget_setlimit(Budget *b, double limit)
     }
     b->budget_limit = limit;
     if (limit == 0.0)
-        printf("  %s✓ Monthly budget limit removed.%s\n\n",
-               COL(C_GREEN), CRESET);
+        printf("  %s✓ Monthly budget limit removed.%s\n\n",  COL(C_GREEN), CRESET);
     else
-        printf("  %s✓ Monthly budget limit set to %.2f%s\n\n",
-               COL(C_GREEN), limit, CRESET);
+        printf("  %s✓ Monthly budget limit set to %.2f%s\n\n", COL(C_GREEN), limit, CRESET);
 }
 
-/*
- * budget_check_limit — Compare current-month expenses to budget_limit.
- * Prints a warning to stderr if the limit is exceeded or nearly so.
- */
 void budget_check_limit(const Budget *b)
 {
     if (b->budget_limit <= 0.0) return;
 
-    /* Get current month string "YYYY-MM" */
     time_t now = time(NULL);
     struct tm *tm_now = localtime(&now);
     char cur_month[8];
@@ -801,13 +721,11 @@ void budget_check_limit(const Budget *b)
                 "\n  %s⚠  BUDGET LIMIT EXCEEDED!%s\n"
                 "  Spent %.2f of %.2f limit (%.1f%% — over by %.2f)\n\n",
                 COL(C_RED), CRESET,
-                expense, b->budget_limit, pct,
-                expense - b->budget_limit);
+                expense, b->budget_limit, pct, expense - b->budget_limit);
     } else if (pct >= 80.0) {
         fprintf(stderr,
                 "\n  %s⚠  Budget warning:%s Spent %.2f of %.2f "
                 "(%.1f%% of monthly limit)\n\n",
-                COL(C_YELLOW), CRESET,
-                expense, b->budget_limit, pct);
+                COL(C_YELLOW), CRESET, expense, b->budget_limit, pct);
     }
 }
