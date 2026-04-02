@@ -220,17 +220,3 @@ budget_limit=1500.00
 - **No memory leaks** — verified with Valgrind and AddressSanitizer
 - **Modular design** — `fileio` and `budget` layers are fully separated
 
----
-
-## CS50 Final Project Notes
-
-This project demonstrates:
-
-- Structs, enums, and typedef
-- Dynamic memory allocation (`malloc`, `realloc`, `free`)
-- File I/O (`fopen`, `fgets`, `fprintf`, `rename`)
-- Multi-file compilation with a Makefile
-- Command-line argument parsing
-- `qsort` with custom comparators
-- ANSI terminal escape codes
-- Defensive input validation
